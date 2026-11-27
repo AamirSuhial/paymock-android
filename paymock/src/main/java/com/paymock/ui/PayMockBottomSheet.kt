@@ -120,7 +120,9 @@ fun PayMockHostOverlay() {
                     PayMockScenario.Success(),
                     PayMockScenario.Cancelled,
                     PayMockScenario.InsufficientFunds,
-                    PayMockScenario.Timeout
+                    PayMockScenario.CardExpired,
+                    PayMockScenario.Timeout,
+                    PayMockScenario.NetworkError
                 )
 
                 if (currentContext.brand.id == "edenred") {

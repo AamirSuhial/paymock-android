@@ -3,12 +3,20 @@ package com.paymock.core
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.util.Log
 import com.paymock.models.*
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.UUID
 
 /**
@@ -16,14 +24,20 @@ import java.util.UUID
  */
 object PayMock {
 
+    private const val TAG = "PayMock"
+
     data class Configuration(
         val simulateLatency: Boolean = true,
         val latencyMillis: Long = 500L,
-        val autoDispatchReturnIntent: Boolean = true
+        val autoInterceptOutboundUris: Boolean = true,
+        val autoDispatchReturnIntent: Boolean = true,
+        val webhookEndpointUrl: String? = null,
+        val webhookDelayMillis: Long = 300L
     )
 
     private var configuration = Configuration()
     private val presetScenarios = mutableMapOf<PaymentBrand, PayMockScenario>()
+    private val webhookScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val _activeSession = MutableStateFlow<PayMockSession?>(null)
     val activeSession: StateFlow<PayMockSession?> = _activeSession.asStateFlow()
@@ -33,8 +47,33 @@ object PayMock {
         val deferred: CompletableDeferred<PayMockResult>
     )
 
-    fun initialize(config: Configuration = Configuration()) {
+    fun initialize(config: Configuration = Configuration(), launchIntent: Intent? = null) {
         this.configuration = config
+        loadLaunchOverrides(launchIntent)
+    }
+
+    /**
+     * Parses Maestro / ADB launch intent extras for headless CI overrides.
+     * Example: `PAYMOCK_FORCE_VIPPS = "cancelled"`, `PAYMOCK_LATENCY = "0"`
+     */
+    fun loadLaunchOverrides(intent: Intent?) {
+        val extras = intent?.extras ?: return
+        if (extras.containsKey("PAYMOCK_LATENCY")) {
+            val latency = extras.getString("PAYMOCK_LATENCY")?.toLongOrNull()
+                ?: extras.getLong("PAYMOCK_LATENCY", configuration.latencyMillis)
+            configuration = configuration.copy(
+                latencyMillis = latency,
+                simulateLatency = latency > 0L
+            )
+        }
+
+        for (brand in PaymentBrand.entries) {
+            val key = "PAYMOCK_FORCE_${brand.id.uppercase()}"
+            val value = extras.getString(key)
+            if (!value.isNullOrBlank()) {
+                presetScenarios[brand] = PayMockScenario.fromString(value)
+            }
+        }
     }
 
     /**
@@ -53,6 +92,38 @@ object PayMock {
     }
 
     /**
+     * Attempts to intercept an outbound wallet URI (e.g. `vippsMT://pay?amount=249&orderId=123&returnUrl=myapp://cb`).
+     * Returns null if the URI does not match a known brand.
+     */
+    suspend fun handleOutboundUri(appContext: Context? = null, uri: Uri): PayMockResult? {
+        if (!configuration.autoInterceptOutboundUris) return null
+        val scheme = uri.scheme?.lowercase() ?: return null
+
+        val brand = PaymentBrand.entries.find {
+            val brandScheme = it.defaultScheme.removeSuffix("://").lowercase()
+            brandScheme == scheme || it.id.lowercase() == scheme
+        } ?: return null
+
+        val amount = uri.getQueryParameter("amount")?.toDoubleOrNull() ?: 0.0
+        val currency = uri.getQueryParameter("currency") ?: brand.defaultCurrency
+        val orderId = uri.getQueryParameter("orderId")
+            ?: uri.getQueryParameter("order_id")
+            ?: "ORD-${(10000..99999).random()}"
+        val returnUrl = uri.getQueryParameter("returnUrl")
+            ?: uri.getQueryParameter("return_url")
+            ?: uri.getQueryParameter("redirect_uri")
+
+        val context = PayMockContext(
+            brand = brand,
+            amount = amount,
+            currency = currency,
+            orderId = orderId,
+            returnUrl = returnUrl
+        )
+        return present(appContext = appContext, context = context)
+    }
+
+    /**
      * Coroutine-based presentation method. Suspends until the user or test selects a scenario.
      */
     suspend fun present(appContext: Context? = null, context: PayMockContext): PayMockResult {
@@ -63,23 +134,25 @@ object PayMock {
                 delay(configuration.latencyMillis)
             }
             val result = resolveResult(context, preset)
-            if (configuration.autoDispatchReturnIntent && appContext != null && context.returnUrl != null) {
-                dispatchReturnIntent(appContext, context.returnUrl, result)
-            }
+            finalizeResolution(appContext, context, result)
             return result
         }
 
-        // 2. Open interactive Compose UI session
+        // 2. Guard against concurrent overlapping sessions
+        if (_activeSession.value != null) {
+            Log.w(TAG, "PayMock session already active; ignoring overlapping present() call.")
+            return PayMockResult.Cancelled
+        }
+
+        // 3. Open interactive Compose UI session
         val deferred = CompletableDeferred<PayMockResult>()
         _activeSession.value = PayMockSession(context, deferred)
 
         val result = deferred.await()
         _activeSession.value = null
 
-        // 3. Dispatch return intent if configured
-        if (configuration.autoDispatchReturnIntent && appContext != null && context.returnUrl != null) {
-            dispatchReturnIntent(appContext, context.returnUrl, result)
-        }
+        // 4. Dispatch return intent & optional webhook
+        finalizeResolution(appContext, context, result)
 
         return result
     }
@@ -100,6 +173,16 @@ object PayMock {
         val session = _activeSession.value ?: return
         session.deferred.complete(PayMockResult.Cancelled)
         _activeSession.value = null
+    }
+
+    private fun finalizeResolution(appContext: Context?, context: PayMockContext, result: PayMockResult) {
+        if (configuration.autoDispatchReturnIntent && appContext != null && context.returnUrl != null) {
+            dispatchReturnIntent(appContext, context.returnUrl, result)
+        }
+        val webhookUrl = configuration.webhookEndpointUrl
+        if (!webhookUrl.isNullOrBlank()) {
+            dispatchWebhook(webhookUrl, context, result)
+        }
     }
 
     fun resolveResult(context: PayMockContext, scenario: PayMockScenario): PayMockResult {
@@ -174,7 +257,45 @@ object PayMock {
         try {
             context.startActivity(intent)
         } catch (e: Exception) {
-            // Log or fallback if scheme not registered
+            Log.w(TAG, "No activity found to handle returnUrl: $returnUrl", e)
+        }
+    }
+
+    private fun dispatchWebhook(webhookUrl: String, context: PayMockContext, result: PayMockResult) {
+        val delayMs = configuration.webhookDelayMillis
+        val (status, txId) = when (result) {
+            is PayMockResult.Success -> "AUTHORIZED" to result.transactionId
+            is PayMockResult.Cancelled -> "CANCELLED" to ""
+            is PayMockResult.Declined -> "DECLINED" to ""
+            is PayMockResult.Timeout -> "EXPIRED" to ""
+            is PayMockResult.NetworkError -> "FAILED" to ""
+        }
+
+        val payload = JSONObject().apply {
+            put("event", "payment.${status.lowercase()}")
+            put("brand", context.brand.id)
+            put("orderId", context.orderId)
+            put("amount", context.amount)
+            put("currency", context.currency)
+            put("status", status)
+            put("transactionId", txId)
+        }.toString()
+
+        webhookScope.launch {
+            if (delayMs > 0) delay(delayMs)
+            try {
+                val conn = (URL(webhookUrl).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    setRequestProperty("Content-Type", "application/json")
+                    setRequestProperty("User-Agent", "PayMock-Android/1.0")
+                    doOutput = true
+                }
+                conn.outputStream.use { it.write(payload.toByteArray()) }
+                conn.responseCode
+                conn.disconnect()
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to dispatch mock webhook to $webhookUrl", e)
+            }
         }
     }
 }
