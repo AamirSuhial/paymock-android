@@ -68,4 +68,13 @@ class PayMockTest {
         assertEquals(15.0, partial.coveredAmount, 0.001)
         assertEquals(15.0, partial.remainingAmount, 0.001)
     }
+
+    @Test
+    fun testScenarioStringAndBrandLookup() {
+        assertEquals(PaymentBrand.VIPPS, PaymentBrand.fromId("vipps"))
+        assertEquals(PaymentBrand.PAYPAY, PaymentBrand.fromId("PAYPAY"))
+        assertTrue(PayMockScenario.fromString("cancelled") is PayMockScenario.Cancelled)
+        assertTrue(PayMockScenario.fromString("insufficient_funds") is PayMockScenario.InsufficientFunds)
+        assertTrue(PayMockScenario.fromString("timeout") is PayMockScenario.Timeout)
+    }
 }

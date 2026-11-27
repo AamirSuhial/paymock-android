@@ -1,5 +1,6 @@
 package com.paymock.sample
 
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -10,6 +11,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.lifecycleScope
 import com.paymock.core.PayMock
 import com.paymock.models.PayMockContext
 import com.paymock.models.PayMockResult
@@ -19,19 +21,25 @@ import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
+    private var deepLinkStatus by mutableStateOf<String?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        PayMock.initialize()
+        PayMock.initialize(launchIntent = intent)
 
         setContent {
+            var lastResultText by remember { mutableStateOf<String?>(null) }
+
             MaterialTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
                     CheckoutScreen(
+                        resultText = lastResultText,
+                        deepLinkText = deepLinkStatus,
                         onPayClicked = { brand, amount, currency ->
-                            lifecycleScopeLaunch {
+                            lifecycleScope.launch {
                                 val result = PayMock.present(
                                     appContext = this@MainActivity,
                                     context = PayMockContext(
@@ -41,7 +49,7 @@ class MainActivity : ComponentActivity() {
                                         returnUrl = "myapp://checkout/callback"
                                     )
                                 )
-                                // Result handled by UI or deep-link
+                                lastResultText = formatResult(result)
                             }
                         }
                     )
@@ -53,19 +61,31 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun lifecycleScopeLaunch(block: suspend () -> Unit) {
-        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
-            block()
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        intent.data?.let { uri ->
+            deepLinkStatus = "Deep Link Received: $uri"
+        }
+    }
+
+    private fun formatResult(result: PayMockResult): String {
+        return when (result) {
+            is PayMockResult.Success -> "Approved! TX: ${result.transactionId} | Token: ${result.token}"
+            is PayMockResult.Cancelled -> "Cancelled by customer. Cart preserved."
+            is PayMockResult.Declined -> "Declined: ${result.reason.localizedMessage()}"
+            is PayMockResult.Timeout -> "Session timed out."
+            is PayMockResult.NetworkError -> "Network connection error."
         }
     }
 }
 
 @Composable
 fun CheckoutScreen(
+    resultText: String?,
+    deepLinkText: String?,
     onPayClicked: (PaymentBrand, Double, String) -> Unit
 ) {
     var selectedBrand by remember { mutableStateOf(PaymentBrand.VIPPS) }
-    var resultText by remember { mutableStateOf<String?>(null) }
 
     Column(
         modifier = Modifier
@@ -87,7 +107,7 @@ fun CheckoutScreen(
                 Text(text = "Order #ORD-9821", style = MaterialTheme.typography.bodySmall)
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = "Total: 249.00 NOK",
+                    text = "Total: 249.00 ${selectedBrand.defaultCurrency}",
                     style = MaterialTheme.typography.titleLarge
                 )
             }
@@ -98,7 +118,13 @@ fun CheckoutScreen(
         Text(text = "Select Payment Method:", style = MaterialTheme.typography.titleSmall)
         Spacer(modifier = Modifier.height(8.dp))
 
-        listOf(PaymentBrand.VIPPS, PaymentBrand.PAYPAY, PaymentBrand.EDENRED, PaymentBrand.IDEAL, PaymentBrand.KLARNA).forEach { brand ->
+        listOf(
+            PaymentBrand.VIPPS,
+            PaymentBrand.PAYPAY,
+            PaymentBrand.EDENRED,
+            PaymentBrand.IDEAL,
+            PaymentBrand.KLARNA
+        ).forEach { brand ->
             Button(
                 onClick = { selectedBrand = brand },
                 colors = ButtonDefaults.buttonColors(
@@ -120,6 +146,23 @@ fun CheckoutScreen(
             modifier = Modifier.fillMaxWidth().height(50.dp)
         ) {
             Text("Pay with ${selectedBrand.displayName}")
+        }
+
+        if (resultText != null || deepLinkText != null) {
+            Spacer(modifier = Modifier.height(20.dp))
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(text = "HOST APP RESULT", style = MaterialTheme.typography.labelSmall)
+                    if (resultText != null) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(text = resultText, style = MaterialTheme.typography.bodyMedium)
+                    }
+                    if (deepLinkText != null) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(text = deepLinkText, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
         }
     }
 }
